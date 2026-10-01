@@ -6,7 +6,8 @@
   "scripts": {
     "dev": "vite --host 0.0.0.0 --port 62058",
     "build": "vue-tsc --noEmit && vite build",
-    "preview": "vite preview --host 0.0.0.0 --port 62058"
+    "preview": "vite preview --host 0.0.0.0 --port 62058",
+    "check": "node scripts/e2e-check.cjs"
   },
   "dependencies": {
     "@apollo/client": "^3.13.8",

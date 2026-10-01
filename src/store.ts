@@ -1,71 +1,66 @@
 import { defineStore } from 'pinia';
 import { graphqlClient, LIFT_PLAN_QUERY } from './graphql';
+import { clone, deepEqual, newId } from './collab/diff';
+import { applyRecord, computeMerged, mergePlans } from './collab/merge';
+import { nextBatchId, onMessage, readServer, writeServer } from './collab/server';
+import { recomputeFindings } from './collab/seed';
+import { upgradeLegacyIfNeeded } from './collab/upgrade';
+import type { Comment, ConflictRecord, LiftStep, PlanState, ReviewBatch, Signoff, StepStatus } from './collab/types';
 
-export type StepStatus = 'pending' | 'passed' | 'blocked';
-export type Comment = {
-  id: string;
-  author: string;
-  role: string;
-  content: string;
-  status: 'open' | 'resolved';
-  stepId: string;
-};
+const BATCH_KEY = 'yy58-lift-plan-batch';
 
-export type LiftStep = {
-  id: string;
-  title: string;
-  time: string;
-  loadRate: number;
-  clearance: number;
-  wind: number;
-  radius: number;
-  boom: number;
-  status: StepStatus;
-  note: string;
-};
+export type { StepStatus };
 
-const initialSteps: LiftStep[] = [
-  { id: 'S-01', title: '吊车支腿就位与地耐力复核', time: '07:30', loadRate: 0, clearance: 4.2, wind: 3.4, radius: 18, boom: 42, status: 'passed', note: '支腿钢板 2.4m × 2.4m，已完成压实度复检。' },
-  { id: 'S-02', title: '空钩回转与障碍物净空检查', time: '08:10', loadRate: 28, clearance: 1.2, wind: 4.1, radius: 22, boom: 46, status: 'blocked', note: '东侧临时配电箱侵入回转半径 0.6m。' },
-  { id: 'S-03', title: '桁架试吊离地 300mm', time: '08:45', loadRate: 76, clearance: 2.8, wind: 5.2, radius: 20, boom: 44, status: 'pending', note: '需安全员确认吊点受力均匀。' },
-  { id: 'S-04', title: '主吊回转至安装轴线', time: '09:20', loadRate: 83, clearance: 1.8, wind: 6.8, radius: 24, boom: 48, status: 'pending', note: '风速超过 8m/s 立即停止。' },
-  { id: 'S-05', title: '双机抬吊姿态调整', time: '10:05', loadRate: 92, clearance: 1.3, wind: 7.2, radius: 27, boom: 52, status: 'blocked', note: '辅吊荷载率超过方案控制值。' },
-  { id: 'S-06', title: '就位、临时固定与摘钩', time: '10:50', loadRate: 68, clearance: 2.1, wind: 5.6, radius: 21, boom: 45, status: 'pending', note: '四组临时螺栓到位后方可摘钩。' }
-];
-
-const initialComments: Comment[] = [
-  { id: 'C-11', author: '周工', role: '安全', content: 'S-02 回转路径与配电箱净空不足，请调整吊车站位或迁移配电箱。', status: 'open', stepId: 'S-02' },
-  { id: 'C-12', author: '刘明', role: '设备', content: '辅吊支腿下方需要补充路基板，提供地耐力实测记录。', status: 'open', stepId: 'S-05' },
-  { id: 'C-13', author: '陈晓', role: '总包', content: '同意主吊选型，建议把第三检查点前移到试吊阶段。', status: 'resolved', stepId: 'S-03' }
-];
-
-const cacheKey = 'yy58-lift-plan-draft';
-const stored = typeof localStorage !== 'undefined' ? localStorage.getItem(cacheKey) : null;
-const saved = stored ? JSON.parse(stored) : null;
+/** 工作副本相对基线发生变更的步骤集合（参数、评论、冲突结论变化） */
+function affectedStepIds(base: PlanState, work: PlanState): Set<string> {
+  const affected = new Set<string>();
+  for (const step of work.steps) {
+    const prev = base.steps.find((item) => item.id === step.id);
+    if (!prev || !deepEqual(prev, step)) affected.add(step.id);
+  }
+  for (const prev of base.steps) {
+    if (!work.steps.some((step) => step.id === prev.id)) affected.add(prev.id);
+  }
+  for (const comment of work.comments) {
+    const prev = base.comments.find((item) => item.id === comment.id);
+    if (!prev) affected.add(comment.stepId);
+    else if (prev.status !== comment.status && comment.status === 'open') affected.add(comment.stepId);
+  }
+  for (const finding of work.findings) {
+    const prev = base.findings.find((item) => item.id === finding.id);
+    if (!prev || prev.status !== finding.status) affected.add(finding.stepId);
+  }
+  return affected;
+}
 
 export const useLiftStore = defineStore('lift-plan', {
   state: () => ({
-    steps: (saved?.steps as LiftStep[]) ?? initialSteps,
-    comments: (saved?.comments as Comment[]) ?? initialComments,
-    selectedStepId: (saved?.selectedStepId as string) ?? 'S-02',
-    revision: (saved?.revision as number) ?? 4,
-    locked: (saved?.locked as boolean) ?? false,
-    viewBookmarks: (saved?.viewBookmarks as string[]) ?? ['主吊全景', '东侧障碍', '安装轴线'],
-    activeBookmark: (saved?.activeBookmark as string) ?? '主吊全景'
+    // 工作副本
+    steps: [] as LiftStep[],
+    comments: [] as Comment[],
+    findings: [] as PlanState['findings'],
+    signoffs: [] as Signoff[],
+    lock: { locked: false, revision: null, lockedBy: null, lockedAt: null, version: 1 } as PlanState['lock'],
+    selectedStepId: 'S-02',
+    viewBookmarks: ['主吊全景', '东侧障碍', '安装轴线'],
+    activeBookmark: '主吊全景',
+    // 复核批次
+    batch: null as ReviewBatch | null,
+    conflicts: [] as ConflictRecord[],
+    conflictDialogOpen: false,
+    // 协同状态
+    online: typeof navigator !== 'undefined' ? navigator.onLine : true,
+    remoteDirty: false,
+    showUpgrade: false,
+    showRecovery: false,
+    toast: ''
   }),
   getters: {
     selectedStep(state): LiftStep {
       return state.steps.find((step) => step.id === state.selectedStepId) ?? state.steps[0];
     },
-    conflicts(state) {
-      return state.steps.flatMap((step) => {
-        const issues: string[] = [];
-        if (step.loadRate > 90) issues.push(`荷载率 ${step.loadRate}% 超过 90% 阈值`);
-        if (step.clearance < 1.5) issues.push(`净空 ${step.clearance}m 小于 1.5m`);
-        if (step.wind > 8) issues.push(`风速 ${step.wind}m/s 超过暂停值`);
-        if (step.radius > step.boom * 0.62) issues.push('工作半径接近额定幅度');
-        return issues.map((message, index) => ({ id: `${step.id}-${index}`, stepId: step.id, title: step.title, message, severity: step.status === 'blocked' ? 'high' : 'medium' }));
-      });
+    openFindings(state) {
+      return state.findings.filter((finding) => finding.status === 'open');
     },
     openComments(state) {
       return state.comments.filter((comment) => comment.status === 'open');
@@ -73,51 +68,368 @@ export const useLiftStore = defineStore('lift-plan', {
     readiness(state): number {
       const passedChecks = state.steps.filter((step) => step.status === 'passed').length;
       const commentPenalty = state.comments.filter((item) => item.status === 'open').length * 12;
-      return Math.max(0, Math.round((passedChecks / state.steps.length) * 100 - commentPenalty));
+      return Math.max(0, Math.round((passedChecks / Math.max(state.steps.length, 1)) * 100 - commentPenalty));
+    },
+    revision(state): number {
+      return state.batch?.baseline.revision ?? state.lock.revision ?? 4;
+    },
+    hasUnsavedChanges(state): boolean {
+      if (!state.batch) return false;
+      const base = state.batch.baseline;
+      return (
+        !deepEqual(state.steps, base.steps) ||
+        !deepEqual(state.comments, base.comments) ||
+        !deepEqual(state.findings, base.findings) ||
+        !deepEqual(state.signoffs, base.signoffs) ||
+        !deepEqual(state.lock, base.lock)
+      );
+    },
+    allSigned(state): boolean {
+      return state.signoffs.length > 0 && state.signoffs.every((item) => item.state === 'accepted' && item.valid);
+    },
+    batchLabel(state): string {
+      return state.batch ? `批次 #${state.batch.batchId}` : '未取批次';
     }
   },
   actions: {
+    init() {
+      const result = upgradeLegacyIfNeeded();
+      if (result.upgraded) {
+        this.showUpgrade = true;
+        this.toast = result.reason ?? '';
+      }
+      const server = readServer();
+      this.resetWorking(server);
+      this.syncApollo(server);
+
+      try {
+        const raw = localStorage.getItem(BATCH_KEY);
+        if (raw) {
+          const saved = JSON.parse(raw);
+          if (saved.batch && (saved.batch.status === 'editing' || saved.batch.status === 'conflict')) {
+            this.showRecovery = true;
+          }
+        }
+      } catch {
+        /* 批次存档损坏时忽略 */
+      }
+
+      onMessage((message) => {
+        if (message.type === 'committed' && this.batch && this.batch.baseline.revision < message.revision) {
+          this.remoteDirty = true;
+        }
+      });
+
+      window.addEventListener('online', () => {
+        this.online = true;
+        if (this.batch) {
+          this.batch.offline = false;
+          if (this.hasUnsavedChanges) this.saveBatch();
+        }
+      });
+      window.addEventListener('offline', () => {
+        this.online = false;
+        if (this.batch) {
+          this.batch.offline = true;
+          this.persistBatch();
+        }
+      });
+    },
+
+    resetWorking(plan: PlanState) {
+      this.steps = clone(plan.steps);
+      this.comments = clone(plan.comments);
+      this.findings = clone(plan.findings);
+      this.signoffs = clone(plan.signoffs);
+      this.lock = clone(plan.lock);
+    },
+
+    workingPlan(): PlanState {
+      return {
+        revision: this.revision,
+        steps: this.steps,
+        comments: this.comments,
+        findings: this.findings,
+        signoffs: this.signoffs,
+        lock: this.lock
+      };
+    },
+
+    /** 修改前先取批次号：以服务端当前状态为基线 */
+    acquireBatch() {
+      const server = readServer();
+      this.batch = {
+        batchId: nextBatchId(),
+        baseline: clone(server),
+        acquiredAt: new Date().toISOString(),
+        status: 'editing',
+        offline: !this.online
+      };
+      this.resetWorking(server);
+      this.conflicts = [];
+      this.conflictDialogOpen = false;
+      this.remoteDirty = false;
+      this.persistBatch();
+    },
+
+    ensureBatch() {
+      if (!this.batch) this.acquireBatch();
+    },
+
+    /**
+     * 保存批次：以基线为基准做三路比对。
+     * 无冲突直接提交；有冲突整批退回冲突清单，由用户选择合并方式。
+     */
+    saveBatch() {
+      this.ensureBatch();
+      if (!this.online) {
+        this.batch!.offline = true;
+        this.toast = '当前离线：修改已暂存在本机，联网后自动保存';
+        this.persistBatch();
+        return;
+      }
+      const base = this.batch!.baseline;
+      const work = this.workingPlan();
+      const server = readServer();
+      const { plan, conflicts } = mergePlans(base, work, server);
+      if (conflicts.length > 0) {
+        this.conflicts = conflicts;
+        this.conflictDialogOpen = true;
+        this.batch!.status = 'conflict';
+        this.persistBatch();
+        return;
+      }
+      this.commit(plan, base, work);
+    },
+
+    /** 用户在冲突清单中选定合并方式后，整批提交 */
+    applyResolutions() {
+      if (!this.batch) return;
+      const base = this.batch.baseline;
+      const work = this.workingPlan();
+      const server = readServer();
+      const { plan, conflicts } = mergePlans(base, work, server);
+
+      // 打开冲突清单后对方又提交了新版本：把新冲突并入清单
+      const known = new Set(this.conflicts.map((item) => `${item.objectType}:${item.objectId}`));
+      const fresh = conflicts.filter((item) => !known.has(`${item.objectType}:${item.objectId}`));
+      if (fresh.length > 0) {
+        this.conflicts = [...this.conflicts, ...fresh];
+        this.batch.status = 'conflict';
+        this.persistBatch();
+        return;
+      }
+
+      for (const record of this.conflicts) {
+        if (record.resolution !== 'keep-local' && record.resolution !== 'keep-remote' && record.resolution !== 'keep-both' && record.resolution !== 'merge') {
+          record.resolution = 'merge';
+        }
+        // 删除/新增冲突不支持字段合并时，默认按「保留本地」处理
+        if (record.resolution === 'merge' && !record.supportsMerge) record.resolution = 'keep-local';
+        if (!record.merged && record.supportsMerge) computeMerged(record);
+        applyRecord(plan, record);
+      }
+      this.conflicts = [];
+      this.conflictDialogOpen = false;
+      this.commit(plan, base, work);
+    },
+
+    /** 提交：失效相关会签与发布锁、复核冲突项、写服务端、换新基线 */
+    commit(plan: PlanState, base: PlanState, work: PlanState) {
+      const affected = affectedStepIds(base, work);
+      let invalidated = false;
+      for (const signoff of plan.signoffs) {
+        // 以基线为准：签署时有效且覆盖的步骤/评论在本批次发生变更，会签即失效
+        const baseSignoff = base.signoffs.find((item) => item.id === signoff.id);
+        const wasAccepted = baseSignoff?.state === 'accepted' && baseSignoff.valid;
+        if (wasAccepted && affected.size > 0 && (signoff.stepIds.length === 0 || signoff.stepIds.some((id) => affected.has(id)))) {
+          signoff.valid = false;
+          signoff.state = 'pending';
+          invalidated = true;
+        }
+      }
+      if (invalidated) {
+        plan.lock = { ...plan.lock, locked: false, revision: null, lockedBy: null, lockedAt: null, version: plan.lock.version + 1 };
+      }
+      for (const signoff of plan.signoffs) {
+        if (signoff.state === 'accepted' && signoff.valid) signoff.basedOnRevision = plan.revision;
+      }
+      plan.findings = recomputeFindings(plan.steps, plan.findings);
+
+      writeServer(plan);
+      this.resetWorking(plan);
+      this.batch!.baseline = clone(plan);
+      this.batch!.status = 'saved';
+      this.conflicts = [];
+      this.conflictDialogOpen = false;
+      this.remoteDirty = false;
+      this.syncApollo(plan);
+      this.persistBatch();
+      const savedBatchId = this.batch!.batchId;
+      this.acquireBatch();
+      this.toast = `批次 #${savedBatchId} 已保存，方案发布至 V${plan.revision}`;
+    },
+
+    /** 工作副本中参数/评论一旦变更，相关会签立即失效（保持失效状态直到重新签署） */
+    recomputeWorkingValidity() {
+      if (!this.batch) return;
+      const affected = affectedStepIds(this.batch.baseline, this.workingPlan());
+      if (affected.size === 0) return;
+      let changed = false;
+      for (const signoff of this.signoffs) {
+        if (signoff.state === 'accepted' && signoff.valid && affected.size > 0 && (signoff.stepIds.length === 0 || signoff.stepIds.some((id) => affected.has(id)))) {
+          signoff.valid = false;
+          signoff.state = 'pending';
+          changed = true;
+        }
+      }
+      if (changed) this.persistBatch();
+    },
+
     selectStep(id: string) {
       this.selectedStepId = id;
-      this.persist();
+      this.persistBatch();
     },
+
     updateStep(patch: Partial<LiftStep>) {
-      const index = this.steps.findIndex((step) => step.id === this.selectedStepId);
-      if (index >= 0) this.steps[index] = { ...this.steps[index], ...patch };
-      this.persist();
+      this.ensureBatch();
+      const step = this.selectedStep;
+      if (!step) return;
+      Object.assign(step, patch);
+      this.recomputeWorkingValidity();
+      this.persistBatch();
     },
+
     setStatus(status: StepStatus) {
       this.updateStep({ status });
     },
+
     addComment(content: string, author = '王工', role = '方案') {
       if (!content.trim()) return;
-      this.comments.unshift({ id: `C-${Date.now()}`, author, role, content, status: 'open', stepId: this.selectedStepId });
-      this.persist();
+      this.ensureBatch();
+      this.comments.unshift({ id: newId('C'), author, role, content, status: 'open', stepId: this.selectedStepId, version: 1 });
+      this.recomputeWorkingValidity();
+      this.persistBatch();
     },
+
     resolveComment(id: string) {
-      const item = this.comments.find((comment) => comment.id === id);
-      if (item) item.status = 'resolved';
-      this.persist();
+      const comment = this.comments.find((item) => item.id === id);
+      if (!comment || comment.status !== 'open') return;
+      this.ensureBatch();
+      comment.status = 'resolved';
+      this.persistBatch();
     },
+
+    toggleFinding(id: string) {
+      this.ensureBatch();
+      const finding = this.findings.find((item) => item.id === id);
+      if (!finding) return;
+      finding.status = finding.status === 'open' ? 'resolved' : 'open';
+      finding.conclusion = finding.status === 'resolved' ? '现场复核确认，按方案执行。' : '';
+      this.recomputeWorkingValidity();
+      this.persistBatch();
+    },
+
+    signoff(id: string) {
+      this.ensureBatch();
+      const item = this.signoffs.find((signoff) => signoff.id === id);
+      if (!item) return;
+      item.state = 'accepted';
+      item.valid = true;
+      item.signedAt = new Date().toISOString();
+      item.basedOnRevision = this.batch!.baseline.revision;
+      this.persistBatch();
+    },
+
     lockPlan() {
-      if (this.conflicts.length === 0 && this.openComments.length === 0) {
-        this.locked = true;
-        this.revision += 1;
-        graphqlClient.writeQuery({
-          query: LIFT_PLAN_QUERY,
-          variables: { id: 'LP-2026-0918' },
-          data: { liftPlan: { __typename: 'LiftPlan', id: 'LP-2026-0918', name: '东塔转换桁架吊装', revision: this.revision, status: 'LOCKED', steps: this.steps } }
-        });
+      if (this.lock.locked) return;
+      if (this.openFindings.length > 0 || this.openComments.length > 0 || !this.allSigned) {
+        this.toast = '发布门禁未满足：冲突清零、意见全部关闭、四个角色完成会签后才能锁定发布';
+        return;
       }
-      this.persist();
+      this.ensureBatch();
+      this.lock = { locked: true, revision: this.revision + 1, lockedBy: '王工', lockedAt: new Date().toISOString(), version: this.lock.version + 1 };
+      this.persistBatch();
+      this.saveBatch();
     },
+
     setBookmark(name: string) {
       this.activeBookmark = name;
       if (!this.viewBookmarks.includes(name)) this.viewBookmarks.push(name);
-      this.persist();
+      this.persistBatch();
     },
-    persist() {
-      if (typeof localStorage !== 'undefined') localStorage.setItem(cacheKey, JSON.stringify({ ...this.$state, draftSavedAt: new Date().toISOString() }));
+
+    discardBatch() {
+      if (!this.batch) return;
+      this.resetWorking(this.batch.baseline);
+      this.batch = null;
+      this.conflicts = [];
+      this.conflictDialogOpen = false;
+      localStorage.removeItem(BATCH_KEY);
+    },
+
+    /** 断网重开后恢复未完成批次 */
+    recoverBatch() {
+      try {
+        const raw = localStorage.getItem(BATCH_KEY);
+        if (raw) {
+          const saved = JSON.parse(raw);
+          if (saved.batch) {
+            const batch = saved.batch as ReviewBatch;
+            this.batch = batch;
+            this.resetWorking(saved.working);
+            this.conflicts = saved.conflicts ?? [];
+            this.conflictDialogOpen = batch.status === 'conflict';
+            this.remoteDirty = false;
+          }
+        }
+      } catch {
+        /* 恢复失败时丢弃存档 */
+      }
+      this.showRecovery = false;
+      this.toast = '已恢复未完成批次，可继续编辑或保存';
+    },
+
+    discardRecovery() {
+      localStorage.removeItem(BATCH_KEY);
+      this.resetWorking(readServer());
+      this.batch = null;
+      this.conflicts = [];
+      this.showRecovery = false;
+    },
+
+    dismissUpgrade() {
+      this.showUpgrade = false;
+    },
+
+    persistBatch() {
+      if (typeof localStorage === 'undefined' || !this.batch) return;
+      localStorage.setItem(
+        BATCH_KEY,
+        JSON.stringify({
+          batch: this.batch,
+          working: this.workingPlan(),
+          conflicts: this.conflicts,
+          savedAt: new Date().toISOString()
+        })
+      );
+    },
+
+    syncApollo(plan: PlanState) {
+      graphqlClient.writeQuery({
+        query: LIFT_PLAN_QUERY,
+        variables: { id: 'LP-2026-0918' },
+        data: {
+          liftPlan: {
+            __typename: 'LiftPlan',
+            id: 'LP-2026-0918',
+            name: '东塔转换桁架吊装',
+            revision: plan.revision,
+            status: plan.lock.locked ? 'LOCKED' : 'REVIEW',
+            steps: plan.steps.map((step) => ({ id: step.id, name: step.title, loadRate: step.loadRate, clearance: step.clearance }))
+          }
+        }
+      });
     }
   }
 });

@@ -3,6 +3,9 @@ import { computed, nextTick, onBeforeUnmount, onMounted, ref } from 'vue';
 import { useRoute, useRouter } from 'vue-router';
 import * as THREE from 'three';
 import { useLiftStore } from './store';
+import BatchBar from './components/BatchBar.vue';
+import ConflictDialog from './components/ConflictDialog.vue';
+import ReviewPanel from './components/ReviewPanel.vue';
 
 const route = useRoute();
 const router = useRouter();
@@ -27,12 +30,26 @@ const nav = [
 
 const pageTitle = computed(() => nav.find((item) => item.path === route.path)?.label ?? '吊装工作台');
 
+const gateOpen = computed(
+  () => store.openFindings.length === 0 && store.openComments.length === 0 && store.allSigned
+);
+
 function go(path: string) {
   router.push(path);
 }
 
 function severityLabel(severity: string) {
   return severity === 'high' ? '阻断' : '预警';
+}
+
+function findingStatusLabel(status: string) {
+  if (status === 'resolved') return '已关闭';
+  if (status === 'waived') return '已接受';
+  return '待处理';
+}
+
+function stepTitle(stepId: string) {
+  return store.steps.find((step) => step.id === stepId)?.title ?? '';
 }
 
 function submitComment() {
@@ -157,6 +174,7 @@ function initializeScene() {
 }
 
 onMounted(() => {
+  store.init();
   nextTick(initializeScene);
 });
 
@@ -177,8 +195,8 @@ onBeforeUnmount(() => {
           <span>东塔转换桁架 · 方案版本 V{{ store.revision }}</span>
         </div>
         <q-space />
-        <q-badge :color="store.locked ? 'teal' : 'orange'" outline class="status-badge">
-          {{ store.locked ? '已锁定发布' : '会签中' }}
+        <q-badge :color="store.lock.locked ? 'teal' : 'orange'" outline class="status-badge">
+          {{ store.lock.locked ? '已锁定发布' : '会签中' }}
         </q-badge>
         <q-btn dense flat round icon="notifications" aria-label="通知">
           <q-badge floating color="red">{{ store.openComments.length }}</q-badge>
@@ -200,7 +218,7 @@ onBeforeUnmount(() => {
           <q-item-section avatar><q-icon :name="item.icon" /></q-item-section>
           <q-item-section>{{ item.label }}</q-item-section>
           <q-item-section v-if="item.path === '/checks'" side>
-            <q-badge color="negative">{{ store.conflicts.length }}</q-badge>
+            <q-badge color="negative">{{ store.openFindings.length }}</q-badge>
           </q-item-section>
         </q-item>
       </q-list>
@@ -219,9 +237,18 @@ onBeforeUnmount(() => {
           </div>
           <div class="heading-actions">
             <q-btn outline no-caps icon="ios_share" label="导出吊装指令" />
-            <q-btn color="primary" no-caps icon="lock" :label="store.locked ? '版本已锁定' : '确认并锁定'" :disable="store.locked || store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
+            <q-btn
+              color="primary"
+              no-caps
+              icon="lock"
+              :label="store.lock.locked ? '版本已锁定' : '确认并锁定'"
+              :disable="store.lock.locked || !gateOpen"
+              @click="store.lockPlan"
+            />
           </div>
         </header>
+
+        <BatchBar />
 
         <section v-if="route.path === '/' || route.path === '/models'" class="work-grid">
           <article class="scene-panel content-panel">
@@ -297,7 +324,7 @@ onBeforeUnmount(() => {
               ]"
             />
             <q-input v-model="store.selectedStep.note" type="textarea" autogrow outlined label="现场控制说明" class="note-input" />
-            <q-btn class="save-step" color="primary" no-caps icon="save" label="保存步骤修改" @click="store.updateStep({})" />
+            <q-btn class="save-step" color="primary" no-caps icon="save" label="保存到复核批次" @click="store.saveBatch" />
           </aside>
         </section>
 
@@ -307,20 +334,33 @@ onBeforeUnmount(() => {
               <span class="panel-kicker">RULE ENGINE</span>
               <h2>冲突定位与条件清单</h2>
             </div>
-            <q-badge color="negative">{{ store.conflicts.length }} 项待处理</q-badge>
+            <q-badge color="negative">{{ store.openFindings.length }} 项待处理</q-badge>
           </div>
           <div class="check-layout">
             <div class="conflict-list">
-              <button v-for="item in store.conflicts" :key="item.id" class="conflict-item" @click="store.selectStep(item.stepId)">
+              <button v-for="item in store.findings" :key="item.id" class="conflict-item" :class="{ closed: item.status !== 'open' }" @click="store.selectStep(item.stepId)">
                 <span class="severity" :class="item.severity">{{ severityLabel(item.severity) }}</span>
-                <div><strong>{{ item.stepId }} · {{ item.title }}</strong><small>{{ item.message }}</small></div>
-                <q-icon name="arrow_forward" />
+                <div>
+                  <strong>{{ item.stepId }} · {{ stepTitle(item.stepId) }}</strong>
+                  <small>{{ item.message }}</small>
+                  <small v-if="item.conclusion" class="conclusion">结论：{{ item.conclusion }}</small>
+                </div>
+                <span class="finding-state">
+                  <q-badge :color="item.status === 'open' ? 'negative' : 'positive'">{{ findingStatusLabel(item.status) }}</q-badge>
+                  <q-btn
+                    flat
+                    dense
+                    no-caps
+                    :label="item.status === 'open' ? '标记关闭' : '重新打开'"
+                    @click.stop="store.toggleFinding(item.id)"
+                  />
+                </span>
               </button>
-              <div v-if="store.conflicts.length === 0" class="empty-state">当前版本未发现规则冲突。</div>
+              <div v-if="store.findings.length === 0" class="empty-state">当前版本未发现规则冲突。</div>
             </div>
             <div class="comments-panel">
               <h3>条件与评论 · {{ store.selectedStep.id }}</h3>
-              <div v-for="comment in store.comments.filter(c => c.stepId === store.selectedStepId)" :key="comment.id" class="comment-row">
+              <div v-for="comment in store.comments.filter((c) => c.stepId === store.selectedStepId)" :key="comment.id" class="comment-row">
                 <div class="comment-avatar">{{ comment.author.slice(0, 1) }}</div>
                 <div>
                   <strong>{{ comment.author }} <small>{{ comment.role }}</small></strong>
@@ -335,37 +375,17 @@ onBeforeUnmount(() => {
           </div>
         </section>
 
-        <section v-if="route.path === '/review'" class="content-panel full-panel">
-          <div class="panel-heading">
-            <div>
-              <span class="panel-kicker">MULTI-PARTY SIGN-OFF</span>
-              <h2>多角色会签与发布门禁</h2>
-            </div>
-            <div class="readiness"><strong>{{ store.readiness }}%</strong><span>发布就绪度</span></div>
-          </div>
-          <div class="review-grid">
-            <article v-for="person in [
-              { name: '陈晓', team: '总包项目部', scope: '吊装工序与场地移交', state: '已接受' },
-              { name: '刘明', team: '设备管理', scope: '吊车参数与支腿地基', state: '待确认' },
-              { name: '周工', team: '安全监督', scope: '净空、风速与警戒区', state: '有保留' },
-              { name: '赵磊', team: '方案工程', scope: '载荷计算与路径参数', state: '待确认' }
-            ]" :key="person.name" class="review-card">
-              <div class="review-head"><strong>{{ person.name }}</strong><q-badge :color="person.state === '已接受' ? 'positive' : person.state === '有保留' ? 'warning' : 'grey'">{{ person.state }}</q-badge></div>
-              <span>{{ person.team }}</span>
-              <p>{{ person.scope }}</p>
-              <q-btn v-if="person.state !== '已接受'" outline no-caps label="接受方案" />
-              <q-btn v-else disable no-caps label="已签署" />
-            </article>
-          </div>
-          <div class="release-gate">
-            <div>
-              <q-icon name="verified_user" size="30px" />
-              <div><strong>发布前门禁</strong><span>要求冲突清零、意见全部关闭、四个角色完成签署。</span></div>
-            </div>
-            <q-btn color="primary" no-caps icon="lock" label="锁定并发布 V{{ store.revision + 1 }}" :disable="store.conflicts.length > 0 || store.openComments.length > 0" @click="store.lockPlan" />
-          </div>
-        </section>
+        <ReviewPanel v-if="route.path === '/review'" />
       </q-page>
     </q-page-container>
+
+    <ConflictDialog />
+
+    <transition name="toast">
+      <div v-if="store.toast" class="app-toast" @click="store.toast = ''">
+        <q-icon name="info" />
+        <span>{{ store.toast }}</span>
+      </div>
+    </transition>
   </q-layout>
 </template>
